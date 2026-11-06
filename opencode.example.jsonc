@@ -1,0 +1,32 @@
+{
+  // OpenCode V2 configuration for a project.
+  // Copy this to `opencode.jsonc` in the project you want to analyze, or merge
+  // it into ~/.config/opencode/opencode.jsonc for a global registration.
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      // Option A: persistent server from docker-compose.yml (recommended when
+      // the server is already running). Plain HTTP, no OAuth.
+      "rea": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8765/mcp",
+        "oauth": false,
+        "timeout": {
+          "startup": 60000,
+          "catalog": 60000,
+          "execution": 43200000
+        }
+      }
+
+      // Option B: one stdio container per OpenCode workspace. Replace the
+      // command with the absolute path to bin/rea-mcp-stdio and remove the
+      // "rea" entry above (or rename one of them).
+      //
+      // "rea-stdio": {
+      //   "type": "local",
+      //   "command": ["/home/sistema/develop/REA/bin/rea-mcp-stdio"],
+      //   "cwd": "."
+      // }
+    }
+  }
+}

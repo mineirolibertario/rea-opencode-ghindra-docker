@@ -1,0 +1,154 @@
+================================================================================
+ REA MCP + OPENCODE — QUICKSTART
+================================================================================
+
+Tested stack. For the full walkthrough see tutorial.txt; for rebuild details see
+spec.md.
+
+--------------------------------------------------------------------------------
+1. BUILD (once)
+--------------------------------------------------------------------------------
+
+  cd /home/sistema/develop/REA
+  cp .env.example .env
+  sed -i "s/^REA_UID=.*/REA_UID=$(id -u)/; s/^REA_GID=.*/REA_GID=$(id -g)/" .env
+  docker compose build
+
+Full image: 4.59 GB. No-browser variant: 3.62 GB (no website/Electron tools):
+
+  docker build --build-arg INSTALL_BROWSER=0 -t rea-mcp:nobrowser .
+
+--------------------------------------------------------------------------------
+2. START THE SERVER
+--------------------------------------------------------------------------------
+
+  docker compose up -d --wait
+
+Endpoint: http://127.0.0.1:8765/mcp   (loopback only, no authentication)
+
+Optional health checks:
+
+  docker compose ps
+  scripts/test-mcp.sh --no-build
+  docker compose exec -T rea rea doctor
+
+--------------------------------------------------------------------------------
+3. CONNECT OPENCODE
+--------------------------------------------------------------------------------
+
+In the project you want to analyze:
+
+  cp /home/sistema/develop/REA/opencode.example.jsonc opencode.jsonc
+
+or create opencode.jsonc with:
+
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "mcp": {
+      "servers": {
+        "rea": {
+          "type": "remote",
+          "url": "http://127.0.0.1:8765/mcp",
+          "oauth": false,
+          "timeout": {
+            "startup": 60000,
+            "catalog": 60000,
+            "execution": 43200000
+          }
+        }
+      }
+    }
+  }
+
+Global alternative: put the same "mcp" block in
+~/.config/opencode/opencode.jsonc.
+
+For one container per project instead of HTTP, use:
+
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "mcp": {
+      "servers": {
+        "rea": {
+          "type": "local",
+          "command": ["/home/sistema/develop/REA/bin/rea-mcp-stdio"],
+          "cwd": "."
+        }
+      }
+    }
+  }
+
+(The image must already be built. Stdio mounts the workspace at the same
+absolute path, so host paths work directly.)
+
+--------------------------------------------------------------------------------
+4. VERIFY
+--------------------------------------------------------------------------------
+
+  opencode mcp list
+
+Expected:
+
+  ✓ rea  connected
+
+First call in a new project may show "pending"; wait a few seconds and retry.
+
+--------------------------------------------------------------------------------
+5. USE IT
+--------------------------------------------------------------------------------
+
+  cd /home/sistema/develop/REA
+  opencode
+
+Example:
+
+  Use the rea server to analyze /work/test (Opened /work/test through REA.) with Ghidra and explain what main
+  does.
+
+Path rule for HTTP mode: the container sees ./workspace as /work. Ask for
+/work/<name>, not your host path. Stdio mode uses the normal host path.
+
+REA 6.8.0 exposes 229 tools. Names: rea_<tool> (or tools.rea.<tool> in Code
+Mode). Prompts: /rea:<prompt>.
+
+--------------------------------------------------------------------------------
+6. STOP
+--------------------------------------------------------------------------------
+
+  docker compose down
+
+--------------------------------------------------------------------------------
+7. COMMON FIXES
+--------------------------------------------------------------------------------
+
+  disconnected          docker compose up -d --wait
+                        docker compose logs --tail=100 rea
+                        timeout 1 bash -c '</dev/tcp/127.0.0.1/8765'
+
+  OAuth error           set "oauth": false in opencode.jsonc
+
+  second agent takes
+  over the first        HTTP mode is single-client; use the stdio option
+
+  file not found        HTTP mode only sees /work; move the target into
+                        ./workspace or switch to stdio
+
+  wrong file owner      set REA_UID/REA_GID in .env, then
+                        docker compose down && docker compose up -d --wait
+
+  Ghidra killed         raise GHIDRA_HEADLESS_MAXMEM and Docker memory
+
+  Chromium won't start  keep REA_BROWSER_NO_SANDBOX=true and shm_size: 1gb,
+                        or use the full image (not the no-browser one)
+
+--------------------------------------------------------------------------------
+FILES
+--------------------------------------------------------------------------------
+
+  quickstart.txt   this file
+  tutorial.txt     full OpenCode + MCP walkthrough
+  README.md        reference, configuration, security
+  spec.md          rebuild notes (full and no-Chromium)
+  compact.md       one-page summary
+  review.md        self-review and known risks
+================================================================================

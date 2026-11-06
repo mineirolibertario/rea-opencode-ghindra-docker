@@ -1,0 +1,80 @@
+name: rea-mcp
+
+services:
+  rea:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        REA_VERSION: ${REA_VERSION:-6.8.0}
+        GHIDRA_VERSION: ${GHIDRA_VERSION:-12.1.4}
+        GHIDRA_BUILD: ${GHIDRA_BUILD:-20260921}
+        INSTALL_GHIDRA: ${INSTALL_GHIDRA:-1}
+        INSTALL_ANDROID: ${INSTALL_ANDROID:-1}
+        INSTALL_BROWSER: ${INSTALL_BROWSER:-1}
+        INSTALL_TSHARK: ${INSTALL_TSHARK:-1}
+        INSTALL_PWNTOOLS: ${INSTALL_PWNTOOLS:-1}
+    image: ${REA_IMAGE:-rea-mcp:local}
+    container_name: ${REA_CONTAINER_NAME:-rea-mcp}
+    init: true
+    user: "${REA_UID:-1000}:${REA_GID:-1000}"
+    # Chromium/Playwright use /dev/shm heavily.
+    shm_size: "1gb"
+    stop_grace_period: 30s
+    command:
+      - rea
+      - mcp
+      - --http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+    environment:
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8765"
+      MCP_ALLOWED_HOSTS: "127.0.0.1,localhost,rea,host.docker.internal"
+      REA_LOG_LEVEL: ${REA_LOG_LEVEL:-info}
+      GHIDRA_HEADLESS_MAXMEM: ${GHIDRA_HEADLESS_MAXMEM:-2G}
+      REA_BROWSER_NO_SANDBOX: "true"
+      # Tool locations are also exported by the entrypoint for the main server.
+      # Repeating them here makes `docker compose exec ... rea ...` one-off
+      # commands see the same configuration. Override or remove entries here
+      # if you rebuild with INSTALL_*=0.
+      JAVA_HOME: ${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}
+      GHIDRA_INSTALL_DIR: ${GHIDRA_INSTALL_DIR:-/opt/ghidra}
+      REA_JADX_MCP_JAR: ${REA_JADX_MCP_JAR:-/opt/rea-tools/jadx-headless-mcp.jar}
+      REA_APKTOOL_COMMAND: ${REA_APKTOOL_COMMAND:-/usr/local/bin/apktool}
+      REA_ADB_PATH: ${REA_ADB_PATH:-/opt/android-platform-tools/platform-tools/adb}
+      REA_BROWSER_EXECUTABLE: ${REA_BROWSER_EXECUTABLE:-/usr/bin/chromium}
+      REA_TSHARK_COMMAND: ${REA_TSHARK_COMMAND:-/usr/bin/tshark}
+      REA_CAPINFOS_COMMAND: ${REA_CAPINFOS_COMMAND:-/usr/bin/capinfos}
+      REA_TSHARK_PRLIMIT_COMMAND: ${REA_TSHARK_PRLIMIT_COMMAND:-/usr/bin/prlimit}
+      REA_FIRMWARE_PRLIMIT_COMMAND: ${REA_FIRMWARE_PRLIMIT_COMMAND:-/usr/bin/prlimit}
+      REA_PWNTOOLS_PYTHON: ${REA_PWNTOOLS_PYTHON:-/usr/bin/python3}
+    ports:
+      # Loopback only: the HTTP transport has no authentication.
+      - "127.0.0.1:${REA_PORT:-8765}:8765"
+    volumes:
+      # Writable analysis workspace. REA tools see this as /work.
+      - ${REA_WORKSPACE:-./workspace}:/work
+    working_dir: /work
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - timeout 2 bash -c '</dev/tcp/127.0.0.1/8765' || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    # Uncomment to inspect USB Android devices attached to the host.
+    # devices:
+    #   - /dev/bus/usb:/dev/bus/usb
+    # Uncomment for Frida / process instrumentation of host processes.
+    # pid: host
+    # cap_add:
+    #   - SYS_PTRACE
+    # security_opt:
+    #   - seccomp:unconfined

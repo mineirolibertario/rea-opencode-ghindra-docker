@@ -1,0 +1,538 @@
+================================================================================
+ USING AN MCP SERVER FROM OPENCODE
+ A practical tutorial, using the REA reverse-engineering server in this repo
+================================================================================
+
+This tutorial shows how to connect OpenCode to an MCP server, verify the
+connection, and actually use the tools. REA is the worked example because it
+exercises the important details: a persistent HTTP transport, a per-project
+stdio transport, container paths, and long-running tools.
+
+
+--------------------------------------------------------------------------------
+0. WHAT YOU WILL END UP WITH
+--------------------------------------------------------------------------------
+
+  OpenCode  ──MCP──>  REA container  ──>  Ghidra / JADX / Apktool / adb /
+                                          Chromium / TShark / pwntools
+
+Two supported ways to connect:
+
+  A. Remote HTTP   OpenCode talks to a container you started yourself.
+                   Best for one agent and a long-running server.
+
+  B. Local stdio   OpenCode starts a container per project and stops it when
+                   the session ends. Best for multiple projects/workspaces.
+
+You only need one of them. Option A is shorter to set up; option B isolates
+projects better.
+
+
+--------------------------------------------------------------------------------
+1. BACKGROUND: WHAT MCP AND OPENCODE DO
+--------------------------------------------------------------------------------
+
+MCP (Model Context Protocol) is a standard way for an AI client (OpenCode) to
+discover and call capabilities exposed by a server (REA).
+
+An MCP server can expose:
+
+  - tools     functions the model can call, with JSON input/output
+  - prompts   reusable prompt templates, often shown as commands
+  - resources optional documents/data the client can read
+
+OpenCode is the client/host. It:
+  - reads MCP server definitions from its config file,
+  - connects to each server at startup,
+  - lists the server's tools and prompts,
+  - lets the model call those tools during a session.
+
+REA servers are identified in this tutorial by the name "rea". OpenCode
+namespaces the tools as rea_<tool> (for example rea_binary_session). In the
+default Code Mode they are called as tools.rea.<tool>.
+
+OpenCode V2 config key is mcp.servers. (Older examples on the internet may use
+a different key; use mcp.servers for V2.)
+
+
+--------------------------------------------------------------------------------
+2. PREREQUISITES
+--------------------------------------------------------------------------------
+
+Required on the host:
+
+  - Docker Engine 24+ with Compose v2
+  - jq (used by the test script)
+  - OpenCode v2 on PATH
+  - this repository at /home/sistema/develop/REA (adjust paths if different)
+
+Check:
+
+  docker --version
+  docker compose version
+  opencode --version
+  jq --version
+
+Disk and memory:
+
+  - ~5 GB for the full image (4.59 GB measured)
+  - ~10 GB free while building the full image
+  - 4 GB RAM for the container; 8 GB+ for large Ghidra targets
+
+Linux x86_64 or arm64. Android adb platform-tools are amd64-only.
+
+
+--------------------------------------------------------------------------------
+3. STEP 1 — BUILD THE REA IMAGE
+--------------------------------------------------------------------------------
+
+  cd /home/sistema/develop/REA
+
+  cp .env.example .env
+  sed -i "s/^REA_UID=.*/REA_UID=$(id -u)/; s/^REA_GID=.*/REA_GID=$(id -g)/" .env
+
+  # Full image: Ghidra + Android + Chromium + TShark + pwntools
+  docker compose build
+
+Building the full image downloads Ghidra (~570 MB compressed) and takes a
+while. If you do not need a browser, build the smaller variant instead:
+
+  docker build --build-arg INSTALL_BROWSER=0 -t rea-mcp:nobrowser .
+
+and use REA_IMAGE=rea-mcp:nobrowser in the commands below.
+
+Verify the image exists:
+
+  docker image ls rea-mcp
+
+
+--------------------------------------------------------------------------------
+4. STEP 2 — START AND TEST THE SERVER
+--------------------------------------------------------------------------------
+
+Start the HTTP MCP server:
+
+  docker compose up -d --wait
+
+The endpoint is:
+
+  http://127.0.0.1:8765/mcp
+
+It is published on loopback only because the transport has no authentication.
+
+Check the container:
+
+  docker compose ps
+  docker compose logs --tail=50 rea
+  timeout 1 bash -c '</dev/tcp/127.0.0.1/8765' && echo listening
+
+Run the included end-to-end test (builds are skipped here):
+
+  scripts/test-mcp.sh --no-build
+
+That script checks REA's providers, the toolchain, starts the service, performs
+an MCP handshake (initialize -> tools/list -> tools/call binary_session), and
+prints the OpenCode status.
+
+Manual provider check:
+
+  docker compose exec -T rea rea doctor
+  docker compose exec -T rea rea mcp doctor
+
+Expected highlights: Ghidra 12.1.4, JDK 21, JADX and the bundled skill are OK.
+Missing Hopper/IDA/Kuna are expected and do not matter.
+
+Keep the server running for Option A.
+
+
+--------------------------------------------------------------------------------
+5. STEP 3 — REGISTER THE SERVER IN OPENCODE (REMOTE HTTP)
+--------------------------------------------------------------------------------
+
+Create opencode.jsonc in the project you want to analyze. OpenCode looks for a
+project-local opencode.jsonc first, then the global config at
+~/.config/opencode/opencode.jsonc.
+
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "mcp": {
+      "servers": {
+        "rea": {
+          "type": "remote",
+          "url": "http://127.0.0.1:8765/mcp",
+          "oauth": false,
+          "timeout": {
+            "startup": 60000,
+            "catalog": 60000,
+            "execution": 43200000
+          }
+        }
+      }
+    }
+  }
+
+The repo already contains this file as opencode.example.jsonc:
+
+  cp opencode.example.jsonc opencode.jsonc
+
+Why each field matters:
+
+  type      "remote" selects HTTP/SSE streamable transport.
+  url       the /mcp path is required. Do not use the bare host:port.
+  oauth     must be false. REA has no OAuth discovery; leaving it on makes
+            OpenCode try (and fail) an OAuth flow.
+  startup   how long OpenCode waits for the server during startup.
+  catalog   how long it waits for tools/list (REA has 229 tools).
+  execution how long a single tool call may run; Ghidra cold starts and large
+            binaries can take minutes, so keep this generous.
+
+For a global registration, put the same "mcp" block in
+~/.config/opencode/opencode.jsonc. A project-local server with the same name
+takes precedence.
+
+The interactive alternative is:
+
+  opencode mcp add
+
+and follow the prompts for a remote server. Editing the file is usually faster.
+
+
+--------------------------------------------------------------------------------
+6. STEP 4 — VERIFY THE CONNECTION
+--------------------------------------------------------------------------------
+
+  opencode mcp list
+
+Expected:
+
+  ✓ rea  connected
+
+If it shows "pending" or "No MCP servers configured" on the very first
+invocation in a new project, OpenCode's per-project background server is still
+starting. Wait a few seconds and run the command again.
+
+If it shows "disconnected":
+
+  - is the container up?              docker compose ps
+  - is the port listening?            timeout 1 bash -c '</dev/tcp/127.0.0.1/8765'
+  - did you change REA_PORT?          update the URL to match
+  - are you using a new hostname?     add it to MCP_ALLOWED_HOSTS and restart
+
+
+--------------------------------------------------------------------------------
+7. STEP 5 — USE THE TOOLS IN A SESSION
+--------------------------------------------------------------------------------
+
+Start OpenCode in the project directory:
+
+  cd /home/sistema/develop/REA
+  opencode
+
+Ask for a harmless first call to prove the connection:
+
+  Use the rea server. Call binary_session with no arguments and tell me whether
+  a target is open, then list two tools for native and Android analysis.
+
+The model may call:
+
+  rea_binary_session
+
+A real analysis request against the sample in this repo:
+
+  Use the rea server to analyze /work/test with Ghidra. Show me the decompiled
+  main function and explain what it prints.
+
+Tool naming:
+
+  - In the normal tool list:      rea_<tool>          e.g. rea_binary_session
+  - In Code Mode (default):       tools.rea.<tool>    e.g. tools.rea.decompile
+  - MCP prompts appear as:        /rea:<prompt>
+
+You normally do not need to know the exact name. Describe the goal and the
+model selects the tool. Naming matters when you script a call or when you want
+to force one specific operation.
+
+To discover what is available, ask:
+
+  List the rea tools related to Android APK analysis.
+
+or inspect the catalog yourself:
+
+  docker compose exec -T rea rea --help
+  docker compose exec -T rea rea providers
+
+
+--------------------------------------------------------------------------------
+8. STEP 6 — ALTERNATIVE: STDIO PER WORKSPACE
+--------------------------------------------------------------------------------
+
+Use this when each project should get its own isolated container, or when more
+than one agent must run at the same time.
+
+Prerequisite: the image is already built (docker compose build).
+
+In the target project's opencode.jsonc:
+
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "mcp": {
+      "servers": {
+        "rea": {
+          "type": "local",
+          "command": ["/home/sistema/develop/REA/bin/rea-mcp-stdio"],
+          "cwd": "."
+        }
+      }
+    }
+  }
+
+What bin/rea-mcp-stdio does:
+
+  - runs `docker run --rm -i --init` for the MCP session,
+  - runs as your UID/GID,
+  - bind-mounts the workspace at the SAME absolute path inside the container,
+  - sets HOME=/tmp/rea-home and REA_BROWSER_NO_SANDBOX=true,
+  - uses image rea-mcp:local unless REA_IMAGE is set.
+
+Because the path is mounted identically, the agent can use the paths it sees
+in the editor directly. No /work translation is needed in this mode.
+
+Optional extra mounts and flags, exported before starting OpenCode:
+
+  export REA_EXTRA_MOUNTS="/opt/apps:/opt/apps:ro /tmp:/tmp"
+  export REA_DOCKER_ARGS="--cap-add SYS_PTRACE --security-opt seccomp=unconfined"
+  opencode
+
+Do not configure the same server name as both remote and local in one file.
+Pick one, or name them differently (for example rea and rea-local).
+
+Verify:
+
+  opencode mcp list
+
+Expected:
+
+  ✓ rea  connected
+
+
+--------------------------------------------------------------------------------
+9. WORKING WITH FILES AND PATHS
+--------------------------------------------------------------------------------
+
+This is the most common source of confusion. The container is not your host.
+
+HTTP mode:
+
+  Host                                Container
+  ./workspace or $REA_WORKSPACE   ->   /work
+  everything else                ->   not visible
+
+  Ask for /work/<name>, not /home/you/... .
+
+  Example:
+    "Analyze /work/test with Ghidra."
+
+Stdio mode:
+
+  The workspace is mounted at the same absolute path, so both of these work:
+    /home/sistema/develop/REA/workspace/test
+    workspace/test   (relative to cwd)
+
+Host loopback:
+
+  Inside the container, 127.0.0.1 is the container itself.
+  To reach a service on the host, use:
+    http://host.docker.internal:3000
+
+To change the HTTP workspace:
+
+  # .env
+  REA_WORKSPACE=/home/sistema/develop/targets
+
+  docker compose down
+  docker compose up -d --wait
+
+To use host absolute paths with HTTP, add a matching bind mount in
+docker-compose.yml:
+
+  volumes:
+    - ${REA_WORKSPACE:-./workspace}:/work
+    - /home/sistema/develop/targets:/home/sistema/develop/targets:ro
+
+
+--------------------------------------------------------------------------------
+10. TOOLS, PROMPTS, AND EXAMPLES
+--------------------------------------------------------------------------------
+
+REA 6.8.0 exposes 229 tools and 6 prompts. Typical categories:
+
+  Native binaries     analyze, decompile, decompile-all, xrefs, strings,
+                      function listing, annotations (Ghidra)
+  Android             APK inspection, manifest/resources (JADX, Apktool),
+                      adb devices/logcat/pull/push
+  Web / Electron      page bundles, browser scenarios, screenshots (Chromium)
+  Network             pcap summaries and packet inspection (TShark)
+  Processes           crash/ELF diagnostics (pwntools, ptrace, adb)
+  Sessions            binary_session and friends
+
+Useful CLI equivalents inside the container:
+
+  docker compose exec -T rea rea analyze /work/test --provider ghidra
+  docker compose exec -T rea rea decompile /work/test --procedure main --provider ghidra
+  docker compose exec -T rea rea analyze /bin/ls --provider ghidra --format json
+
+Example prompts that work well:
+
+  "Use rea to open /work/test and explain what main does. Show the evidence."
+  "List the functions in /work/samples/crackme and decompile the one that
+   validates the password."
+  "Inspect /work/samples/app.apk and summarize the exported services and their
+   permissions."
+  "Read /work/samples/http.pcap and list the HTTP hosts and user agents."
+
+Prompt templates (if exposed by the server) are invoked as commands:
+
+  /rea:<prompt-name>
+
+Check the current inventory any time:
+
+  docker compose exec -T rea rea mcp doctor
+
+
+--------------------------------------------------------------------------------
+11. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+Symptom: opencode mcp list shows "No MCP servers configured"
+  Cause: OpenCode did not find the config, or the server entry is under the
+  wrong key.
+  Fix: the file must be opencode.jsonc in the project root or
+  ~/.config/opencode/opencode.jsonc, and the key must be mcp.servers.
+
+Symptom: the first call says "pending" and a later call works
+  Cause: OpenCode starts MCP servers per project in the background.
+  Fix: wait a few seconds and re-run opencode mcp list.
+
+Symptom: "disconnected" in remote mode
+  Cause: server not running, wrong port, or Host header rejected.
+  Fix:
+    docker compose up -d --wait
+    docker compose logs --tail=100 rea
+    timeout 1 bash -c '</dev/tcp/127.0.0.1/8765'
+  MCP_ALLOWED_HOSTS must contain every client hostname/IP, without scheme or
+  port. Default: 127.0.0.1,localhost,rea,host.docker.internal
+
+Symptom: OAuth errors in remote mode
+  Cause: oauth not disabled.
+  Fix: set "oauth": false.
+
+Symptom: a second OpenCode window takes over the first (remote mode)
+  Cause: REA's HTTP transport is stateful and single-client; a new initialize
+  replaces the previous session.
+  Fix: use one agent per HTTP server, or use the stdio option.
+
+Symptom: the agent cannot find a file
+  Cause: HTTP mode only sees /work.
+  Fix: put the target under ./workspace (or REA_WORKSPACE) and use /work/...,
+  or switch to stdio mode.
+
+Symptom: files in the workspace are owned by the wrong user
+  Cause: container UID/GID do not match the host.
+  Fix: set REA_UID and REA_GID in .env, then:
+    docker compose down && docker compose up -d --wait
+
+Symptom: Ghidra is killed on a large binary
+  Cause: JVM heap or container memory too small.
+  Fix: raise GHIDRA_HEADLESS_MAXMEM (for example 8G) and give Docker more RAM.
+
+Symptom: Chromium will not start
+  Cause: containers normally cannot use the Chromium sandbox.
+  Fix: keep REA_BROWSER_NO_SANDBOX=true and shm_size: 1gb. In the no-browser
+  image, browser tools are expected to be unavailable.
+
+Symptom: "rea doctor" exits non-zero
+  Cause: optional commercial providers (Hopper/IDA/Kuna) are missing.
+  Fix: nothing. Check that the required checks are ok; the test script does
+  exactly that.
+
+
+--------------------------------------------------------------------------------
+12. SECURITY AND LIMITS
+--------------------------------------------------------------------------------
+
+  - The HTTP transport has no authentication. Keep it bound to 127.0.0.1.
+    Never publish it on 0.0.0.0 or a public interface.
+  - Mount only the workspace. Prefer :ro for untrusted targets.
+  - Do not mount the Docker socket or your whole home directory.
+  - Analysis targets are hostile input. Parsers (Ghidra, JADX, Apktool,
+    TShark, browsers) can have vulnerabilities. Use resource limits and only
+    the mounts you need.
+  - Frida, USB, and pid:host are opt-in and enlarge the attack surface.
+  - REA is not a sandbox. Tools run with the container user's permissions.
+  - Commercial engines are not included and carry their own licenses.
+
+
+--------------------------------------------------------------------------------
+13. CHEAT SHEET
+--------------------------------------------------------------------------------
+
+Build:
+  cd /home/sistema/develop/REA
+  cp .env.example .env
+  docker compose build
+
+Run the HTTP server:
+  docker compose up -d --wait
+
+Stop it:
+  docker compose down
+
+Endpoint:
+  http://127.0.0.1:8765/mcp
+
+Remote config (opencode.jsonc):
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "mcp": {
+      "servers": {
+        "rea": {
+          "type": "remote",
+          "url": "http://127.0.0.1:8765/mcp",
+          "oauth": false,
+          "timeout": { "startup": 60000, "catalog": 60000, "execution": 43200000 }
+        }
+      }
+    }
+  }
+
+Local stdio config (opencode.jsonc):
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "mcp": {
+      "servers": {
+        "rea": {
+          "type": "local",
+          "command": ["/home/sistema/develop/REA/bin/rea-mcp-stdio"],
+          "cwd": "."
+        }
+      }
+    }
+  }
+
+Verify:
+  opencode mcp list
+
+Test the stack:
+  scripts/test-mcp.sh --no-build
+
+Analyze a file:
+  inside OpenCode:  "Use rea to analyze /work/test with Ghidra."
+  CLI:              docker compose exec -T rea rea analyze /work/test --provider ghidra
+
+Docs in this repo:
+  README.md      full setup and reference
+  spec.md        rebuild notes, full and no-Chromium variants
+  compact.md     one-page summary
+  review.md      self-review and known risks
+
+================================================================================
